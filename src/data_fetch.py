@@ -1,7 +1,6 @@
 # src/data_fetch.py
 import pandas as pd
 import yfinance as yf
-from pandas_datareader.data import DataReader
 import datetime as dt
 
 def fetch_stock(ticker, start, end):
@@ -103,3 +102,4 @@ def fetch_buffett_fallback(start, end):
     except Exception as e:
         # if even this fails, return None (app will handle)
         return None
+
