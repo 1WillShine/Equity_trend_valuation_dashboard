@@ -1,105 +1,107 @@
 # src/data_fetch.py
 import pandas as pd
 import yfinance as yf
-import datetime as dt
+import requests
 
+# -------------------------------------------
+# 1. Fetch Stock Prices (yfinance only)
+# -------------------------------------------
 def fetch_stock(ticker, start, end):
-    """Return daily adj close DataFrame for ticker."""
-    df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
-    # keep Adjusted Close as 'Adj Close' or use 'Close' if auto_adjust True
-    if 'Close' in df.columns:
-        out = df['Close'].to_frame(name=ticker)
+    """
+    Return daily adjusted close prices for a ticker.
+    Compatible with Streamlit Cloud (no pandas_datareader).
+    """
+    df = yf.download(
+        ticker,
+        start=start,
+        end=end,
+        auto_adjust=True,
+        progress=False
+    )
+
+    # Prefer 'Close' because auto_adjust=True already adjusts it
+    if "Close" in df.columns:
+        out = df[["Close"]].rename(columns={"Close": ticker})
     else:
-        out = df['Adj Close'].to_frame(name=ticker)
+        out = df[["Adj Close"]].rename(columns={"Adj Close": ticker})
+
     out.index = pd.to_datetime(out.index)
     return out
 
 
-def fetch_wilshire_and_gdp(start, end):
-    """
-    Try to fetch Wilshire market cap (WILL5000INDFC) and GDP (GDP) from FRED and return a DataFrame
-    with a Buffett ratio (marketcap / GDP). If that fails, raise an Exception and caller can fallback.
-    """
-    # series ids may change; handle exceptions
-    # WILL5000INDFC = Wilshire 5000 Total Market Full Cap (try)
-    try:
-        wil = DataReader('WILL5000INDFC', 'fred', start, end)   # total market cap series
-        gdp = DataReader('GDP', 'fred', start, end)             # GDP (billions of $) — FRED units
-        # Align frequencies: will likely be daily / monthly; GDP is quarterly. Convert both to quarterly
-        wil_q = wil.resample('Q').last()
-        # If will is index rather than dollar value, make sure units are comparable — user check encouraged.
-        ratio = (wil_q['WILL5000INDFC'] / gdp['GDP']).rename('buffett_ratio')
-        ratio = ratio.to_frame()
-        return ratio
-    except Exception as e:
-        raise
+# -------------------------------------------
+# 2. Fetch Wilshire 5000 + GDP (via FRED JSON API)
+# -------------------------------------------
 
-def fetch_buffett_fallback(start, end):
-    """
-    Fallback: fetch FRED series that directly gives Stock Market Cap to GDP ratio if available.
-    Example series ID: 'DDDM01USA156NWDB' (Stock Market Capitalization to GDP for United States).
-    This series may be annual; check frequency and resample as needed.
-    """
-    try:
-        series = DataReader('DDDM01USA156NWDB', 'fred', start, end)
-        series.columns = ['buffett_ratio_percent']
-        # convert percent to ratio
-        series['buffett_ratio'] = series['buffett_ratio_percent'] / 100.0
-        return series[['buffett_ratio']]
-    except Exception as e:
-        # if even this fails, return None (app will handle)
-        return None
+FRED_API_KEY = ""  # Optional. Leaving blank still works with public series.
 
-# src/data_fetch.py
-import pandas as pd
-import yfinance as yf
-from pandas_datareader.data import DataReader
-import datetime as dt
+def _fred_request(series_id):
+    """Internal helper to call FRED's JSON API safely."""
+    url = "https://api.stlouisfed.org/fred/series/observations"
+    params = {
+        "series_id": series_id,
+        "api_key": FRED_API_KEY,
+        "file_type": "json"
+    }
 
-def fetch_stock(ticker, start, end):
-    """Return daily adj close DataFrame for ticker."""
-    df = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
-    # keep Adjusted Close as 'Adj Close' or use 'Close' if auto_adjust True
-    if 'Close' in df.columns:
-        out = df[['Close']].rename(columns={'Close': ticker})
+    r = requests.get(url, params=params, timeout=10)
+    r.raise_for_status()
+    data = r.json()
 
-    else:
-        out = df['Adj Close'].rename(ticker).to_frame()
-    out.index = pd.to_datetime(out.index)
-    return out
+    if "observations" not in data:
+        raise Exception(f"FRED: No observations returned for {series_id}")
+
+    df = pd.DataFrame(data["observations"])
+    df = df[df["value"] != "."].copy()
+    df["value"] = pd.to_numeric(df["value"])
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.set_index("date")[["value"]]
+    df.columns = [series_id]
+    return df
+
 
 def fetch_wilshire_and_gdp(start, end):
     """
-    Try to fetch Wilshire market cap (WILL5000INDFC) and GDP (GDP) from FRED and return a DataFrame
-    with a Buffett ratio (marketcap / GDP). If that fails, raise an Exception and caller can fallback.
+    Compute Buffett Indicator = Wilshire 5000 Total Market Cap / US GDP.
+    Uses FRED JSON API (Streamlit-safe).
     """
-    # series ids may change; handle exceptions
-    # WILL5000INDFC = Wilshire 5000 Total Market Full Cap (try)
     try:
-        wil = DataReader('WILL5000INDFC', 'fred', start, end)   # total market cap series
-        gdp = DataReader('GDP', 'fred', start, end)             # GDP (billions of $) — FRED units
-        # Align frequencies: will likely be daily / monthly; GDP is quarterly. Convert both to quarterly
-        wil_q = wil.resample('Q').last()
-        # If will is index rather than dollar value, make sure units are comparable — user check encouraged.
-        ratio = (wil_q['WILL5000INDFC'] / gdp['GDP']).rename('buffett_ratio')
-        ratio = ratio.to_frame()
-        return ratio
+        wil = _fred_request("WILL5000INDFC")
+        gdp = _fred_request("GDP")
+
+        # Restrict to requested window
+        wil = wil.loc[start:end]
+        gdp = gdp.loc[start:end]
+
+        # Align to quarterly
+        wil_q = wil.resample("Q").last()
+        gdp_q = gdp.resample("Q").last()
+
+        ratio = (wil_q["WILL5000INDFC"] / gdp_q["GDP"]).rename("buffett_ratio")
+        return ratio.to_frame()
+
     except Exception as e:
+        print("Primary Wilshire + GDP fetch failed:", e)
         raise
+
+
+# -------------------------------------------
+# 3. Fallback — Stock Market Cap / GDP (%)
+# -------------------------------------------
 
 def fetch_buffett_fallback(start, end):
     """
-    Fallback: fetch FRED series that directly gives Stock Market Cap to GDP ratio if available.
-    Example series ID: 'DDDM01USA156NWDB' (Stock Market Capitalization to GDP for United States).
-    This series may be annual; check frequency and resample as needed.
+    Fallback FRED series:
+    'DDDM01USA156NWDB' = Stock Market Cap to GDP (percent).
     """
     try:
-        series = DataReader('DDDM01USA156NWDB', 'fred', start, end)
-        series.columns = ['buffett_ratio_percent']
-        # convert percent to ratio
-        series['buffett_ratio'] = series['buffett_ratio_percent'] / 100.0
-        return series[['buffett_ratio']]
-    except Exception as e:
-        # if even this fails, return None (app will handle)
-        return None
+        df = _fred_request("DDDM01USA156NWDB")
 
+        df = df.loc[start:end]
+        df["buffett_ratio"] = df["DDDM01USA156NWDB"] / 100.0  # convert percent to ratio
+
+        return df[["buffett_ratio"]]
+
+    except Exception as e:
+        print("Buffett fallback fetch failed:", e)
+        return None
